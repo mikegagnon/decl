@@ -91,6 +91,18 @@ object TaskSetSpec {
   val ComputeEngaged = DummyComputeTask(inputConfig=Set(),
                                   inputFeatures=Set(Tweets, NumFollowers, NumFollowees),
                                   outputFeatures=Set(IsEngaged))
+  /**
+   * TaskSet
+   ************************************************************************************************/
+
+  val dummyTasks = Set[Task](
+    LoadUserTable,
+    LoadFollowings,
+    LoadTweets,
+    ComputeFollowCounts,
+    ComputeBusiness,
+    ComputeIsSpam,
+    ComputeEngaged)
 }
 
 /**
@@ -150,5 +162,51 @@ class TaskSetSpec extends FlatSpec with ShouldMatchers {
       Args("--MaxFollowings 7"),
       loadTasks=Set(LoadFollowings),
       computeTasks=Nil) should equal(ConfigMap(MaxFollowings -> 7))
+  }
+
+  /**
+   * TaskSet.scheduleTasks
+   ************************************************************************************************/
+  "TaskSet.scheduleTasks" should "schedule a single load task if that is all that is needed" in {
+    TaskSet.scheduleTasks(dummyTasks, Set(ScreenName)) should equal (
+      Set(LoadUserTable),
+      Nil)
+  }
+
+  it should "schedule a single load task if that is all that is needed for multiple features" in {
+    TaskSet.scheduleTasks(dummyTasks, Set(ScreenName, Bio)) should equal (
+      Set(LoadUserTable),
+      Nil)
+  }
+
+  it should "schedule load and compute tasks if a single computed feature is needed" in {
+    TaskSet.scheduleTasks(dummyTasks, Set(IsBusiness)) should equal (
+      Set(LoadUserTable, LoadTweets),
+      List(ComputeBusiness))
+  }
+
+  it should "schedule __ordered__ compute tasks if one computed feature depends on another" in {
+    TaskSet.scheduleTasks(dummyTasks, Set(IsEngaged)) should equal (
+      Set(LoadFollowings, LoadTweets),
+      List(ComputeFollowCounts, ComputeEngaged))
+  }
+
+  it should "schedule many tasks if many features are needed" in {
+
+    val result = TaskSet.scheduleTasks(dummyTasks, Set(IsEngaged, IsBusiness))
+
+    val expectedLoadTasks = Set[LoadTask](LoadUserTable, LoadFollowings, LoadTweets)
+
+    /**
+     * computeFollowCounts, computeEngaged must be ordered relative to each other
+     * computeBusiness can appear anywhere
+     */
+    val possibleResults = Set[(Set[LoadTask], List[ComputeTask])] (
+      (expectedLoadTasks, List(ComputeBusiness, ComputeFollowCounts, ComputeEngaged)),
+      (expectedLoadTasks, List(ComputeFollowCounts, ComputeBusiness, ComputeEngaged)),
+      (expectedLoadTasks, List(ComputeFollowCounts, ComputeEngaged, ComputeBusiness)))
+
+    assert(possibleResults.contains(result))
+
   }
 }
