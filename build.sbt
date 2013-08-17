@@ -13,7 +13,7 @@ resolvers ++= Seq(
   "releases" at "http://oss.sonatype.org/content/repositories/releases",
   "Concurrent Maven Repo" at "http://conjars.org/repo",
   "Clojars Repository" at "http://clojars.org/repo",
-  "Twitter Maven" at "http://maven.twttr.com",
+  "Twitter Maven" at "http://maven.twttr.com"
 )
 
 libraryDependencies ++= Seq(
