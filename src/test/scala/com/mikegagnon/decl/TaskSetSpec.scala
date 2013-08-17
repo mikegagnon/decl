@@ -5,9 +5,17 @@ import org.scalatest.FlatSpec
 import org.scalatest.junit.JUnitRunner
 import org.scalatest.matchers.ShouldMatchers
 
-import com.twitter.scalding.Args
+import cascading.flow.FlowDef
+
+import com.twitter.algebird.Monoid
+import com.twitter.scalding._
+
+import scala.collection.mutable.Buffer
 
 object TaskSetSpec {
+  import Dsl._
+  import TDsl._
+
   /**
    * Dummy features
    ************************************************************************************************/
@@ -69,28 +77,190 @@ object TaskSetSpec {
   /**
    * Load tasks
    ************************************************************************************************/
-  val LoadUserTable = DummyLoadTask(inputConfig=Set(),
-                            outputFeatures=Set(UserId, ScreenName, Bio))
-  val LoadFollowings = DummyLoadTask(inputConfig=Set(MaxFollowings),
-                            outputFeatures=Set(UserId, Followees, Followers))
-  val LoadTweets = DummyLoadTask(inputConfig=Set(MaxTweetLen),
-                            outputFeatures=Set(UserId, Tweets))
+  case object LoadUserTable extends LoadTask {
+    override val inputConfig = Set[ConfigValue[_]]()
+    override val outputFeatures = Set[FeatureBase[_]](UserId, ScreenName, Bio)
+
+    override def load(config: ConfigMap)(implicit flowDef: FlowDef, mode: Mode)
+        : TypedPipe[FeatureMap] = {
+      TypedTsv[(Long, String, String)]("LoadUserTable.tsv")
+        .map { case (userId, sn, bio) =>
+          FeatureMap(
+            UserId -> userId,
+            ScreenName -> sn,
+            Bio -> bio)
+        }
+    }
+  }
+
+  case object LoadFollowings extends LoadTask {
+    override val inputConfig = Set[ConfigValue[_]](MaxFollowings)
+    override val outputFeatures = Set[FeatureBase[_]](UserId, Followees, Followers)
+
+    override def load(config: ConfigMap)(implicit flowDef: FlowDef, mode: Mode)
+        : TypedPipe[FeatureMap] = {
+
+      val maxFollowings = config(MaxFollowings)
+
+      TypedTsv[(Long, List[Long], List[Long])]("LoadFollowings.tsv")
+        .map { case (userId, followees, followers) =>
+          FeatureMap(
+            UserId -> userId,
+            Followees -> followees.take(maxFollowings),
+            Followers -> followers.take(maxFollowings))
+        }
+    }
+  }
+
+  case object LoadTweets extends LoadTask {
+    override val inputConfig = Set[ConfigValue[_]](MaxTweetLen)
+    override val outputFeatures = Set[FeatureBase[_]](UserId, Tweets)
+
+    override def load(config: ConfigMap)(implicit flowDef: FlowDef, mode: Mode)
+        : TypedPipe[FeatureMap] = {
+
+      val maxTweetLen = config(MaxTweetLen)
+
+      TypedTsv[(Long, String)]("LoadTweets.tsv")
+        .map { case (userId, tweet) =>
+
+          val tweetTrimmed = maxTweetLen match {
+            case None => tweet
+            case Some(len) => tweet.take(len)
+          }
+
+          FeatureMap(
+            UserId -> userId,
+            Tweets -> List(tweetTrimmed))
+        }
+    }
+  }
+
+  case object LoadErroneousFeature extends LoadTask {
+    override val inputConfig = Set[ConfigValue[_]]()
+    override val outputFeatures = Set[FeatureBase[_]](UserId, ErroneousFeature)
+
+    override def load(config: ConfigMap)(implicit flowDef: FlowDef, mode: Mode)
+        : TypedPipe[FeatureMap] = {
+      TypedTsv[(Long, Double)]("LoadErroneousFeature.tsv")
+        .map { case (userId, num) =>
+          FeatureMap(
+            UserId -> userId,
+            ErroneousFeature -> num)
+        }
+    }
+  }
 
   /**
    * Compute tasks
    ************************************************************************************************/
-  val ComputeFollowCounts = DummyComputeTask(inputConfig=Set(),
-                                  inputFeatures=Set(Followees, Followers),
-                                  outputFeatures=Set(NumFollowers, NumFollowees))
-  val ComputeBusiness = DummyComputeTask(inputConfig=Set(),
-                                  inputFeatures=Set(Bio, ScreenName, Tweets),
-                                  outputFeatures=Set(IsBusiness))
-  val ComputeIsSpam = DummyComputeTask(inputConfig=Set(Keywords),
-                                  inputFeatures=Set(Tweets),
-                                  outputFeatures=Set(IsSpam))
-  val ComputeEngaged = DummyComputeTask(inputConfig=Set(),
-                                  inputFeatures=Set(Tweets, NumFollowers, NumFollowees),
-                                  outputFeatures=Set(IsEngaged))
+
+  case object ComputeFollowCounts extends ComputeTask {
+    override val inputConfig = Set[ConfigValue[_]]()
+    override val inputFeatures = Set[FeatureBase[_]](Followees, Followers)
+    override val outputFeatures = Set[FeatureBase[_]](NumFollowers, NumFollowees)
+
+    override def compute(features: FeatureMap, config: ConfigMap): FeatureMap = {
+
+      val numFollowees = features.get(Followees)
+        .map{ followees => FeatureMap(NumFollowees -> followees.size) }
+        .getOrElse(FeatureMap())
+      val numFollowers = features.get(Followers)
+        .map{ followers => FeatureMap(NumFollowers -> followers.size) }
+        .getOrElse(FeatureMap())
+      Monoid.plus(numFollowees, numFollowers)
+    }
+  }
+
+  case object ComputeBusiness extends ComputeTask {
+    override val inputConfig = Set[ConfigValue[_]]()
+    override val inputFeatures = Set[FeatureBase[_]](Bio, ScreenName, Tweets)
+    override val outputFeatures = Set[FeatureBase[_]](IsBusiness)
+
+    override def compute(features: FeatureMap, config: ConfigMap): FeatureMap = {
+      (features.get(Bio), features.get(ScreenName), features.get(Tweets)) match {
+        case (Some(bio), Some(sn), Some(head :: tail)) => FeatureMap(IsBusiness -> 1.0)
+        case _ => FeatureMap(IsBusiness -> 0.0)
+      }
+    }
+  }
+
+  case object ComputeIsSpam extends ComputeTask {
+    override val inputConfig = Set[ConfigValue[_]](Keywords)
+    override val inputFeatures = Set[FeatureBase[_]](Tweets)
+    override val outputFeatures = Set[FeatureBase[_]](IsSpam)
+
+    override def compute(features: FeatureMap, config: ConfigMap): FeatureMap = {
+
+      features.get(Tweets)
+        .map{ tweets =>
+          val matches = tweets.toSet & config(Keywords)
+          if (matches.isEmpty) {
+            FeatureMap(IsSpam -> 0.0)
+          } else {
+            FeatureMap(IsSpam -> 1.0)
+          }
+        }
+        .getOrElse(FeatureMap(IsSpam -> 0.0))
+    }
+  }
+
+  class ComputeSpamTweets(keyword: String) extends ComputeTask {
+    override val inputConfig = Set[ConfigValue[_]]()
+    override val inputFeatures = Set[FeatureBase[_]](Tweets)
+    override val outputFeatures = Set[FeatureBase[_]](SpamTweets)
+
+    override def compute(features: FeatureMap, config: ConfigMap): FeatureMap = {
+
+      features.get(Tweets)
+        .map{ tweets =>
+          val spamTweets = tweets
+            .toSet
+            .filter(_ == keyword)
+          FeatureMap(SpamTweets -> spamTweets)
+        }
+        .getOrElse(FeatureMap())
+    }
+  }
+
+  // these two tasks compute the same feature, but do it differently
+  case object ComputeSpamTweets1 extends ComputeSpamTweets("spam1")
+  case object ComputeSpamTweets2 extends ComputeSpamTweets("spam2")
+
+  case object ComputeEngaged extends ComputeTask {
+    override val inputConfig = Set[ConfigValue[_]]()
+    override val inputFeatures = Set[FeatureBase[_]](Tweets, NumFollowers, NumFollowees)
+    override val outputFeatures = Set[FeatureBase[_]](IsEngaged)
+
+    override def compute(features: FeatureMap, config: ConfigMap): FeatureMap = {
+
+      (features.get(Tweets), features.get(NumFollowers), features.get(NumFollowees)) match {
+        case (Some(head :: tail), Some(numFollowers), Some(numFollowees)) => {
+          if (numFollowers > 0 && numFollowees > 0) {
+            FeatureMap(IsEngaged -> 1.0)
+          } else {
+            FeatureMap(IsEngaged -> 0.0)
+          }
+        }
+        case _ => FeatureMap(IsEngaged -> 0.0)
+      }
+    }
+  }
+
+  case object ComputeCycle1 extends ComputeTask {
+    override val inputConfig = Set[ConfigValue[_]]()
+    override val inputFeatures = Set[FeatureBase[_]](CycleFeature2)
+    override val outputFeatures = Set[FeatureBase[_]](CycleFeature1)
+    override def compute(features: FeatureMap, config: ConfigMap): FeatureMap = FeatureMap()
+  }
+
+  case object ComputeCycle2 extends ComputeTask {
+    override val inputConfig = Set[ConfigValue[_]]()
+    override val inputFeatures = Set[FeatureBase[_]](CycleFeature1)
+    override val outputFeatures = Set[FeatureBase[_]](CycleFeature2)
+    override def compute(features: FeatureMap, config: ConfigMap): FeatureMap = FeatureMap()
+  }
+
   /**
    * TaskSet
    ************************************************************************************************/
@@ -99,10 +269,137 @@ object TaskSetSpec {
     LoadUserTable,
     LoadFollowings,
     LoadTweets,
+    LoadErroneousFeature,
     ComputeFollowCounts,
     ComputeBusiness,
     ComputeIsSpam,
-    ComputeEngaged)
+    ComputeEngaged,
+    ComputeSpamTweets1,
+    ComputeSpamTweets2,
+    ComputeCycle1,
+    ComputeCycle2)
+
+  object Users extends TaskSet[Long] {
+    override val groupByKey = UserId
+    override val tasks = dummyTasks
+  }
+
+  /**
+   * Dummy data
+   ************************************************************************************************/
+
+  // userId, screenName, bio
+  val userTableData: List[(Long, String, String)] = List(
+    (1L, "foo", "bar"),
+    (2L, "baz", "pickle"))
+
+  // userId, followees, followers
+  val followingsData: List[(Long, List[Long], List[Long])] = List(
+    (1L, List(2L, 3L, 4L), List(4L, 5L, 6L)),
+    (3L, List(1L, 2L), List(6L)))
+
+  val tweetData: List[(Long, String)] = List(
+    (1L, "spam1"),
+    (1L, "spam2"),
+    (1L, "c"),
+    (2L, "spam2"),
+    (2L, "pickle"),
+    (3L, "bananas"))
+
+  // This data is erroneous because user 1L has multiple records
+  val erroneousFeatureData: List[(Long, Double)] = List(
+    (1L, 1.0),
+    (1L, 2.0),
+    (2L, 3.0))
+
+  /**
+   * Helper functions
+   ************************************************************************************************/
+
+  def testJob[T: Manifest](jobName: String, args: Map[String, List[String]]): JobTest = {
+    val jobTest = JobTest("com.mikegagnon.decl." + jobName)
+      .source(TypedTsv[(Long, String, String)]("LoadUserTable.tsv"), userTableData)
+      .source(TypedTsv[(Long, List[Long], List[Long])]("LoadFollowings.tsv"), followingsData)
+      .source(TypedTsv[(Long, String)]("LoadTweets.tsv"), tweetData)
+      .source(TypedTsv[(Long, Double)]("LoadErroneousFeature.tsv"), erroneousFeatureData)
+
+    args.foreach { case (key, value) =>
+      jobTest.arg(key, value)
+    }
+
+    jobTest
+
+  }
+}
+
+/**
+ * Scalding jobs
+ **************************************************************************************************/
+
+class ScreenNameJob(args: Args) extends Job(args) {
+  import TaskSetSpec._
+  Users.get(args, UserId, ScreenName)
+    .write(TypedTsv[(Option[Long], Option[String])]("output.tsv"))
+}
+
+class TweetsJob(args: Args) extends Job(args) {
+  import TaskSetSpec._
+  Users.get(args, UserId, Tweets)
+    .write(TypedTsv[(Option[Long], Option[List[String]])]("output.tsv"))
+}
+
+class FollowersScreenNameJob(args: Args) extends Job(args) {
+  import TaskSetSpec._
+  Users.get(args, UserId, Followers, ScreenName)
+    .write(TypedTsv[(Option[Long], Option[List[Long]], Option[String])]("output.tsv"))
+}
+
+class ComputeNumFollowersJob(args: Args) extends Job(args) {
+  import TaskSetSpec._
+  Users.get(args, UserId, ScreenName, NumFollowers)
+    .write(TypedTsv[(Option[Long], Option[String], Option[Int])]("output.tsv"))
+}
+
+class ComputeSpamTweetsJob(args: Args) extends Job(args) {
+  import TaskSetSpec._
+  Users.get(args, UserId, SpamTweets)
+    .write(TypedTsv[(Option[Long], Option[Set[String]])]("output.tsv"))
+}
+
+class IsBusinessJob(args: Args) extends Job(args) {
+  import TaskSetSpec._
+  Users.get(args, UserId, IsBusiness)
+    .write(TypedTsv[(Option[Long], Option[Double])]("output.tsv"))
+}
+
+class IsSpamJob(args: Args) extends Job(args) {
+  import TaskSetSpec._
+  Users.get(args, UserId, IsSpam)
+    .write(TypedTsv[(Option[Long], Option[Double])]("output.tsv"))
+}
+
+class IsEngagedJob(args: Args) extends Job(args) {
+  import TaskSetSpec._
+  Users.get(args, UserId, IsEngaged)
+    .write(TypedTsv[(Option[Long], Option[Double])]("output.tsv"))
+}
+
+class ErroneousFeatureJob(args: Args) extends Job(args) {
+  import TaskSetSpec._
+  Users.get(args, UserId, ErroneousFeature)
+    .write(TypedTsv[(Option[Long], Option[Double])]("output.tsv"))
+}
+
+class ErroneousCycleJob(args: Args) extends Job(args) {
+  import TaskSetSpec._
+  Users.get(args, UserId, CycleFeature1)
+    .write(TypedTsv[(Option[Long], Option[Double])]("output.tsv"))
+}
+
+class ErroneousOrphanJob(args: Args) extends Job(args) {
+  import TaskSetSpec._
+  Users.get(args, UserId, OrphanFeature)
+    .write(TypedTsv[(Option[Long], Option[Double])]("output.tsv"))
 }
 
 /**
@@ -111,6 +408,7 @@ object TaskSetSpec {
 @RunWith(classOf[JUnitRunner])
 class TaskSetSpec extends FlatSpec with ShouldMatchers {
 
+  import Dsl._
   import TaskSetSpec._
 
   /**
@@ -208,5 +506,212 @@ class TaskSetSpec extends FlatSpec with ShouldMatchers {
 
     assert(possibleResults.contains(result))
 
+  }
+
+  /**
+   * TaskSet.get
+   ************************************************************************************************/
+
+   "ScreenNameJob" should "fetch two features from a single source" in {
+
+    type OutputTuple = (Option[Long], Option[String])
+
+    val expectedOutput: Set[OutputTuple] = Set(
+      (Some(1L), Some("foo")),
+      (Some(2L), Some("baz")))
+
+    testJob("ScreenNameJob", args = Map())
+      .sink[OutputTuple](TypedTsv[OutputTuple]("output.tsv")) { buf =>
+        buf.toSet should equal (expectedOutput)
+      }
+      .run
+      .finish
+  }
+
+  "TweetsJob" should
+    "reduce multiple tweet records into a single Tweets feature and use a configuration value" in {
+
+    type OutputTuple = (Option[Long], Option[List[String]])
+
+    val expectedOutput: Set[OutputTuple] = Set(
+      (Some(1L), Some(List("s", "s", "c"))),
+      (Some(2L), Some(List("s", "p"))),
+      (Some(3L), Some(List("b"))))
+
+    testJob(
+        jobName ="TweetsJob",
+        args = Map("MaxTweetLen" -> List("1")))
+      .sink[OutputTuple](TypedTsv[OutputTuple]("output.tsv")) { buf =>
+        buf.toSet should equal (expectedOutput)
+      }
+      .run
+      .finish
+  }
+
+  "FollowersScreenNameJob" should "fetch and join three features from multiple sources" in {
+
+    type OutputTuple = (Option[Long], Option[List[Long]], Option[String])
+
+    val expectedOutput: Set[OutputTuple] = Set(
+      (Some(1L), Some(List(4L, 5L)), Some("foo")),
+      (Some(2L), None, Some("baz")),
+      (Some(3L), Some(List(6L)), None))
+
+    testJob(
+        jobName = "FollowersScreenNameJob",
+        args = Map("MaxFollowings" -> List("2")))
+      .sink[OutputTuple](TypedTsv[OutputTuple]("output.tsv")) { buf =>
+        buf.toSet should equal (expectedOutput)
+      }
+      .run
+      .finish
+  }
+
+  "ComputeNumFollowersJob" should "compute a simple feature" in {
+
+    type OutputTuple = (Option[Long], Option[String], Option[Int])
+
+    val expectedOutput: Set[OutputTuple] = Set(
+      (Some(1L), Some("foo"), Some(3)),
+      (Some(2L), Some("baz"), None),
+      (Some(3L), None, Some(1)))
+
+    testJob(
+        jobName = "ComputeNumFollowersJob",
+        args = Map("MaxFollowings" -> List("10")))
+      .sink[OutputTuple](TypedTsv[OutputTuple]("output.tsv")) { buf =>
+        buf.toSet should equal (expectedOutput)
+      }
+      .run
+      .finish
+  }
+
+  "ComputeSpamTweetsJob" should
+    ("yield a single feature that is computed by two distinct compute tasks, " +
+     "and reduced via the feature's semigroup") in {
+
+    type OutputTuple = (Option[Long], Option[Set[String]])
+
+    val expectedOutput: Set[OutputTuple] = Set(
+      (Some(1L), Some(Set("spam1", "spam2"))),
+      (Some(2L), Some(Set("spam2"))),
+      (Some(3L), Some(Set())))
+
+    testJob(jobName = "ComputeSpamTweetsJob", args = Map())
+      .sink[OutputTuple](TypedTsv[OutputTuple]("output.tsv")) { buf =>
+        buf.toSet should equal (expectedOutput)
+      }
+      .run
+      .finish
+  }
+
+  "IsBusinessJob" should "compute a feature that is derived from multiple sources" in {
+
+    type OutputTuple = (Option[Long], Option[Double])
+
+    val expectedOutput: Set[OutputTuple] = Set(
+      (Some(1L), Some(1.0)),
+      (Some(2L), Some(1.0)),
+      (Some(3L), Some(0.0)))
+
+    testJob(jobName = "IsBusinessJob", args = Map())
+      .sink[OutputTuple](TypedTsv[OutputTuple]("output.tsv")) { buf =>
+        buf.toSet should equal (expectedOutput)
+      }
+      .run
+      .finish
+  }
+
+  "IsEngagedJob" should
+    "compute a feature that as function of other computed features and a loaded feature" in {
+
+    type OutputTuple = (Option[Long], Option[Double])
+
+    val expectedOutput: Set[OutputTuple] = Set(
+      (Some(1L), Some(1.0)),
+      (Some(2L), Some(0.0)),
+      (Some(3L), Some(1.0)))
+
+    testJob(
+        jobName = "IsEngagedJob",
+        args = Map("MaxFollowings" -> List("10")))
+      .sink[OutputTuple](TypedTsv[OutputTuple]("output.tsv")) { buf =>
+        buf.toSet should equal (expectedOutput)
+      }
+      .run
+      .finish
+  }
+
+  /**
+   * calls to TaskSet.get that raise an exception.
+   * TODO: is there a way to silence the error messages caused by these test cases?
+   ************************************************************************************************/
+
+  "ErroneousFeatureJob" should
+    "throw a FlowException caused by a DuplicateFeatureException exception" in {
+
+    type OutputTuple = (Option[Long], Option[Double])
+
+    evaluating {
+      testJob(
+          jobName = "ErroneousFeatureJob",
+          args = Map())
+        .sink[OutputTuple](TypedTsv[OutputTuple]("output.tsv")) { buf =>
+          buf.toSet should equal (Set())
+        }
+        .run
+        .finish
+    } should produce [cascading.flow.FlowException]
+  }
+
+  "ErroneousCycleJob" should
+    "throw a InvocationTargetException caused by a CycleException exception" in {
+
+    type OutputTuple = (Option[Long], Option[Double])
+
+    evaluating {
+      testJob(
+          jobName = "ErroneousCycleJob",
+          args = Map())
+        .sink[OutputTuple](TypedTsv[OutputTuple]("output.tsv")) { buf =>
+          buf.toSet should equal (Set())
+        }
+        .run
+        .finish
+    } should produce [java.lang.reflect.InvocationTargetException]
+  }
+
+  "ComputeNumFollowersJob" should
+    "throw a InvocationTargetExcept exception if MaxFollowings isn't specified" in {
+
+    type OutputTuple = (Option[Long], Option[String], Option[Int])
+
+    evaluating {
+      testJob(
+          jobName = "ComputeNumFollowersJob",
+          args = Map())
+        .sink[OutputTuple](TypedTsv[OutputTuple]("output.tsv")) { buf =>
+          buf.toSet should equal (Set())
+        }
+        .run
+        .finish
+    } should produce [java.lang.reflect.InvocationTargetException]
+  }
+
+  "ErroneousOrphanJob" should
+    "throw a InvocationTargetException caused by a NoLoadTasksException exception" in {
+
+    type OutputTuple = (Option[Long], Option[Double])
+
+    evaluating {
+      testJob(
+          jobName = "ErroneousOrphanJob",
+          args = Map())
+        .sink[OutputTuple](TypedTsv[OutputTuple]("output.tsv")) { buf =>
+          buf.toSet should equal (Set())
+        }
+        .run
+        .finish
+    } should produce [java.lang.reflect.InvocationTargetException]
   }
 }

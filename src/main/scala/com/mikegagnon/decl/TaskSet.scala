@@ -1,6 +1,15 @@
 package com.mikegagnon.decl
 
-import com.twitter.scalding.Args
+import cascading.flow.FlowDef
+import com.twitter.algebird.Semigroup
+
+import com.twitter.scalding.{
+  Args,
+  Dsl,
+  Mode,
+  TypedPipe}
+
+class NoLoadTasksException(msg: String) extends Exception(msg)
 
 object TaskSet {
 
@@ -72,4 +81,123 @@ object TaskSet {
     (loadTasks, computeTasks)
   }
 
+}
+
+abstract class TaskSet[V: Ordering] extends Serializable {
+
+  import Dsl._
+
+  // note: groupByKey must be a feature __without__ a reducer
+  val groupByKey: Feature[V]
+  val tasks: Set[Task]
+
+  final def get[
+          Feature1[Value1] <: FeatureBase[_],
+          Value1 <: Feature1[Value1]#V]
+         (args: Args,
+          feature1: Feature1[Value1])
+         (implicit flowDef: FlowDef, mode: Mode)
+         : TypedPipe[Option[Value1]]
+    = run(args, Set(feature1)) { fmap: FeatureMap =>
+      fmap.get(feature1)
+    }
+
+  final def get[
+          Feature1[Value1] <: FeatureBase[_],
+          Feature2[Value2] <: FeatureBase[_],
+          Value1 <: Feature1[Value1]#V,
+          Value2 <: Feature2[Value2]#V]
+         (args: Args,
+          feature1: Feature1[Value1],
+          feature2: Feature2[Value2])
+         (implicit flowDef: FlowDef, mode: Mode)
+         : TypedPipe[(Option[Value1], Option[Value2])]
+    = run(args, Set(feature1, feature2)) { fmap: FeatureMap =>
+        (fmap.get(feature1),
+         fmap.get(feature2))
+    }
+
+  final def get[
+          Feature1[Value1] <: FeatureBase[_],
+          Feature2[Value2] <: FeatureBase[_],
+          Feature3[Value3] <: FeatureBase[_],
+          Value1 <: Feature1[Value1]#V,
+          Value2 <: Feature2[Value2]#V,
+          Value3 <: Feature2[Value3]#V]
+         (args: Args,
+          feature1: Feature1[Value1],
+          feature2: Feature2[Value2],
+          feature3: Feature3[Value3])
+         (implicit flowDef: FlowDef, mode: Mode)
+         : TypedPipe[(Option[Value1], Option[Value2], Option[Value3])]
+     = run(args, Set(feature1, feature2, feature3)) { fmap: FeatureMap =>
+        (fmap.get(feature1),
+         fmap.get(feature2),
+         fmap.get(feature3))
+    }
+
+  // TODO: add get functions for more than 3 features (perhaps using Ruby macros)
+
+  final private[decl] def run[T](
+      args: Args,
+      features: Set[FeatureBase[_]])
+     (projector: FeatureMap => T)
+     (implicit flowDef: FlowDef, mode: Mode): TypedPipe[T] = {
+
+    val outputFeatures = features.filter{ _ != groupByKey }
+
+    val (loadTasks: Set[LoadTask],
+        computeTasks: List[ComputeTask]) = TaskSet.scheduleTasks(tasks, outputFeatures)
+
+    val config: ConfigMap = TaskSet.initConfig(args, loadTasks, computeTasks)
+
+    // run the Load tasks
+    val loadedPipe: Option[TypedPipe[FeatureMap]] = loadTasks
+      // is there a better collection function?
+      .foldLeft(None: Option[TypedPipe[FeatureMap]]) { case (pipeOption, loadTask) =>
+        pipeOption match {
+          case None => Some(loadTask.run(groupByKey, config))
+          case Some(pipe) => Some(pipe ++ loadTask.run(groupByKey, config))
+        }
+      }
+
+    // group and sum the results of the load tasks
+    val groupedPipe: TypedPipe[FeatureMap] = loadedPipe match {
+      case None => throw new NoLoadTasksException(
+        "Cannot compute features because the scheduler did not find any load tasks. " +
+        "You are trying to load or compute a feature that this TaskSet doesn't know how to " +
+        "load or compute. This can happen for example if you forget to add a task to the TaskSet.")
+      case Some(pipe) => pipe
+        .map { featureMap: FeatureMap =>
+          val key = featureMap.get(groupByKey)
+          if (key.isEmpty) {
+            throw new RuntimeException((
+              "While grouping the loaded features, encountered a FeatureMap that is missing the " +
+              "groupByKey == %s.").format(groupByKey))
+          }
+          (key.get, featureMap)
+        }
+        .group
+        .reduce { (left, right) =>
+          // Do not include the groupByKey in the Semigroup.plus because there will be duplicate
+          // values for groupByKey and we do not want to sum those values
+          val sumFeatureMap = Semigroup.plus(left - groupByKey, right - groupByKey)
+          sumFeatureMap + (groupByKey -> left.get(groupByKey).get)
+        }
+        .map { case (key, featureMap) =>
+          featureMap
+        }
+    }
+
+    // run the compute tasks
+    val computedPipe: TypedPipe[FeatureMap] = groupedPipe
+      .map { featureMap: FeatureMap =>
+        computeTasks.foldLeft(featureMap) { case (featureMap: FeatureMap, task: ComputeTask) =>
+          Semigroup.plus(featureMap, task.compute(featureMap, config))
+        }
+      }
+
+    // project each featureMap to a value of type T
+    computedPipe.map(projector)
+  }
 }
