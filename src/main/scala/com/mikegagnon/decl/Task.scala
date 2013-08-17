@@ -16,6 +16,6 @@ trait Task extends Serializable {
   // Every task outputs one or more features; this specifies the features this task output
   val outputFeatures: Set[FeatureBase[_]]
 
-  lazy val input: Set[Argument] =
+  lazy val inputArgs: Set[Argument] =
     inputConfig.map{ a => a: Argument } ++ inputFeatures.map{ a => a: Argument }
 }

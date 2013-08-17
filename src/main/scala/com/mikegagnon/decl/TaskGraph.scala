@@ -8,7 +8,7 @@ class TaskGraph(override val nodes: Set[Task]) extends Dag[Task] {
   // First step: map each argument to the set of tasks that accept that argument
   val requires: Map[Argument, Set[Task]] = nodes
     .flatMap { task =>
-      task.input.map{ arg: Argument => (arg, task: Task) }
+      task.inputArgs.map{ arg: Argument => (arg, task: Task) }
     }
     .groupBy { _._1 }
     .mapValues { pairs: Set[(Argument, Task)] =>
