@@ -13,10 +13,7 @@ import cascading.flow.FlowDef
  * DagSpec.scala. This suite simply tests
  *
  * This spec only needs to test the TaskGraph mapping from Tasks to nodes and edges.
- *
- * @author Mike Gagnon
  */
-
 case class DummyLoadTask(inputConfig: Set[ConfigValue[_]], outputFeatures: Set[FeatureBase[_]])
     extends LoadTask {
   override def load(config: ConfigMap)
@@ -108,5 +105,4 @@ class TaskGraphSpec extends FlatSpec with ShouldMatchers {
   it should "compute ancestors correctly for compute4" in {
     graph.ancestors(compute4) should equal (Set(load1, load2, load3, compute1, compute2, compute3))
   }
-
 }
