@@ -1,4 +1,4 @@
-package com.twitter.ads.batch.job.declarative2
+package com.mikegagnon.decl
 
 import com.twitter.algebird.Semigroup
 import com.twitter.scalding.Args
