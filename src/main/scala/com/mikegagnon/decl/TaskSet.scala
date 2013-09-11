@@ -91,6 +91,15 @@ abstract class TaskSet[V: Ordering] extends Serializable {
   val groupByKey: Feature[V]
   val tasks: Set[Task]
 
+  final def include(taskset: TaskSet[V]): TaskSet[V] = {
+    require(taskset.groupByKey == groupByKey)
+    val myTasks = tasks
+    new TaskSet {
+      override val groupByKey = taskset.groupByKey
+      override val tasks = myTasks ++ taskset.tasks
+    }
+  }
+
   final def get[
           Feature1[Value1] <: FeatureBase[_],
           Value1 <: Feature1[Value1]#V]
@@ -201,3 +210,4 @@ abstract class TaskSet[V: Ordering] extends Serializable {
     computedPipe.map(projector)
   }
 }
+
